@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Sign one account in to Google once: start the server, have it open Google's page, wait for the token to land."""
+import argparse, re, socket, time
+from urllib.parse import unquote
+import kit
+
+SCREENS = """
+Your browser opens Google's sign-in. What you'll see, in order:
+  1. Choose an account. Pick {email}.
+  2. "Google hasn't verified this app". You made this app, so that's expected. Click Continue. If the page
+     has no Continue, click Advanced, then "Go to <your app name> (unsafe)".
+  3. The list of what the app may do. Tick every box, or "Select all", then click Continue.
+  4. A page titled "Authentication Successful". Close it and come back here.
+Screens 2 and 3 are worded as Google's own gws CLI guide has them; yours may differ slightly."""
+
+
+def busy(port):
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def main():
+    p = argparse.ArgumentParser(description="Sign one account in to Google.")
+    p.add_argument("--account", default="main", type=kit.valid_account)
+    p.add_argument("--dry-run", action="store_true", help="say what would happen and change nothing")
+    p.add_argument("--yes", action="store_true", help="answer yes and skip the Enter: for when Claude runs this")
+    a = p.parse_args()
+    data = kit.load(a.account)
+    email, old = data["kit"]["email"], kit.token_files(a.account)
+    taken = [port for port in range(8000, 8005) if busy(port)]
+    if len(taken) == 5:
+        kit.done("ports 8000 to 8004 are all in use, and Google's answer comes back on one of them. "
+                 "Close the program holding them (docs/10-trouble.md shows how to find it) and run ./auth again.", 1)
+    if 8000 in taken:
+        print(f"Port 8000 is in use, so Google's answer will come back on port {min(set(range(8000, 8005)) - set(taken))}.")
+    stamp = f"{kit.now():%Y%m%d-%H%M%S}"
+    if old:
+        print(f"{a.account} already has a token: " + ", ".join(t.name for t in old))
+        print(f"Signing in again moves it aside as <name>.bak-{stamp}, so the new one can land.")
+        if a.dry_run:
+            print("[dry run] would ask before moving it")
+        elif not kit.ask("Move it aside and sign in again?"):
+            kit.done("kept the token you have. ./doctor checks whether it still works.")
+    print(SCREENS.format(email=email))
+    if a.dry_run:
+        kit.done(f"dry run: would start {kit.PACKAGE} for '{a.account}' and wait for the token in {kit.tokens(a.account)}.")
+    note = f"\nThe token and the time you sign in get saved in {kit.folder(a.account)}."
+    print(note) if kit.YES else input(note + " Press Enter to open the browser. ")
+    for token in old:
+        token.rename(token.with_name(f"{token.name}.bak-{stamp}"))
+    kit.private_dir(kit.tokens(a.account))
+    server = kit.workspace(a.account, data)
+    try:
+        ok, text = server.call("start_google_auth", {"service_name": "Google Workspace", "user_google_email": email}, 60)
+        url = re.search(r"Authorization URL: (\S+)", text)
+        if not url:
+            kit.done(f"the server didn't start the sign-in. It said: {text.strip().splitlines()[0][:200]}", 1)
+        print(f"\nIf no browser window opened, copy this address into your browser:\n\n{url.group(1)}\n")
+        print("Waiting for Google's answer (10 minutes at most) ...")
+        deadline = time.time() + 600
+        while not kit.token_files(a.account):
+            if server.proc.poll() is not None:
+                kit.done("the server stopped before Google answered. Run ./doctor to see why.", 1)
+            if time.time() > deadline:
+                kit.done("no answer from Google in 10 minutes. Run ./auth again.", 1)
+            time.sleep(1)
+        time.sleep(2)   # let the browser page finish loading
+    finally:
+        server.close()
+    token = kit.token_files(a.account)[0]
+    who = unquote(token.stem)
+    data["kit"]["signed_in"] = kit.now().isoformat(timespec="seconds")
+    kit.save(a.account, data)
+    print(f"\nSigned in as {who}. The token is {token}, readable by you alone.")
+    if who != email:
+        print(f"That isn't the address in the config ({email}). Run ./auth again and pick {email}, or ./setup to change it.")
+    if data["kit"]["audience"] == "testing":
+        print("Your app is in Testing, so Google ends this sign-in in 7 days. docs/03-consent.md shows how to publish it.")
+    kit.done(f"signed in '{a.account}'. Next: ./doctor --account {a.account}")
+
+
+if __name__ == "__main__":
+    kit.guarded(main)

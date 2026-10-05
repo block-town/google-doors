@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Check one account end to end: the installs, the config, the sign-ins, then one read-only call per Google service
+and one to Google Analytics. It reads; it sends, writes and deletes nothing in your Google account.
+Exits 0 only when every service answers."""
+import argparse, datetime, json, re, shutil, subprocess
+import kit
+
+ADMIN = ("ask your Workspace admin to trust the app: admin.google.com > Security > Access and data control > API controls"
+         " > Manage Third-Party App Access > Add app > OAuth App Name or Client ID > {cid} > Trusted. docs/05-admin.md")
+
+
+GA_APIS = "analyticsadmin.googleapis.com,analyticsdata.googleapis.com"
+CONNECTORS = ("Anthropic's own Google connectors on claude.ai (Gmail, Calendar, Drive, and the Docs, Sheets and Slides beta) "
+              "are separate servers with their own sign-in: this kit neither needs them nor clashes with them")
+
+
+def verdict(service, ok, text, log, data):
+    """Name the fault from what Google and the server said, and the fix for it."""
+    again = "./auth-analytics" if service == "analytics" else "./auth"
+    if ok:
+        return "ok", ""
+    if "admin_policy_enforced" in text + log:
+        return "admin", ADMIN.format(cid=data["installed"]["client_id"])
+    if service == "appscript" and re.search(r"not enabled the Apps Script API|usersettings|Service error -27", text):
+        return "switch", "turn on your own Apps Script API switch: https://script.google.com/home/usersettings"
+    if re.search(r"accessNotConfigured|SERVICE_DISABLED|has not been used in project|not enabled for your project", text):
+        return "api", f"turn the API on in your Google Cloud project: {kit.ENABLE}{GA_APIS if service == 'analytics' else kit.SERVICES[service][0]}"
+    if "invalid_grant" in text + log or "expired or revoked" in text:
+        week = " (an app in Testing loses it after 7 days)" if data["kit"]["audience"] == "testing" else ""
+        return "expired", f"Google ended the sign-in{week}: run {again}"
+    if re.search(r"ACTION REQUIRED|Authentication Needed|insufficient authentication scopes|SCOPE_INSUFFICIENT", text):
+        return "token", f"the sign-in doesn't cover this service, or it has lapsed: run {again} and tick every box"
+    if service == "forms" and re.search(r"not found|404|400|invalid", text, re.I):
+        return "ok", "Google says the made-up form doesn't exist, which means the API answered"
+    return "fail", (text.strip().splitlines() or ["no text came back"])[0][:200]
+
+
+def probe_analytics(account, data, line):
+    """One read-only call to Google's Analytics server: the accounts and properties this sign-in can see."""
+    print("\nStarting the Analytics server and asking for your account summaries.")
+    try:
+        server = kit.analytics(account, data)
+        ok, text = server.call("get_account_summaries", {})
+        log = "\n".join(x for x in server.log if x)
+        server.close()
+    except (TimeoutError, RuntimeError, ConnectionError) as error:
+        ok, text, log = False, str(error), ""
+    if ok and text.lstrip().startswith('{"error"'):   # this server reports failures as ordinary text
+        ok, text = False, json.loads(text)["error"]
+    state, fix = verdict("analytics", ok, text, log, data)
+    empty = ok and text.strip() in ("", "[]")
+    line("note" if empty else state, "analytics get_account_summaries" + (": no Analytics account visible" * empty), fix)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Check one account end to end.")
+    p.add_argument("--account", default="main", type=kit.valid_account)
+    p.add_argument("--dry-run", action="store_true", help="list the checks and calls without making them")
+    a = p.parse_args()
+    problems = []
+
+    def line(state, what, fix=""):
+        print(f"{state:8}{what}" + (f"\n        {fix}" if fix else ""))
+        if state not in ("ok", "note"):
+            problems.append(what)
+
+    data, path = kit.load(a.account), kit.config_path(a.account)
+    line("ok", f"config {path} ({data['kit']['email']}, {data['kit']['audience']})")
+    if path.stat().st_mode & 0o077:
+        line("warn", "other users on this computer can read the config", f"chmod 600 '{path}'")
+    for name in kit.shell_overrides():
+        line("warn", f"{name} is set in your shell; Claude Code passes it on and it overrides this kit",
+             "remove it from your shell profile and open a new terminal")
+    uv_path, analytics = kit.uv(), data["kit"].get("analytics")
+    for package in [kit.PACKAGE] + [kit.ANALYTICS[0]] * bool(analytics):
+        version, pinned = (kit.installed(uv_path, package) if uv_path else None), kit.PINS[package][0]
+        line("ok" if version == pinned else "fail", f"{package} {version or 'not installed'}, pinned {pinned}",
+             "" if version == pinned else "run ./setup")
+    claude = shutil.which("claude")
+    for names in [sorted({kit.entry_name(a.account), "google"})] + [[kit.entry_name(a.account, "analytics")]] * bool(analytics):
+        found = [(n, r.stdout) for n in (names if claude else []) for r in [subprocess.run(
+            [claude, "mcp", "get", n], capture_output=True, text=True)] if r.returncode == 0]   # this starts it, to check
+        status = re.search(r"Status: *(.+)", found[0][1]) if found else None
+        if not claude:
+            line("note", "no claude command on your PATH, so Claude Code's entries go unchecked")
+            break
+        elif not found:
+            line("fail", f"Claude Code has no server named {' or '.join(names)}", "run ./setup (or ./setup --gateway)")
+        else:
+            good = bool(status) and "Connected" in status.group(1)
+            line("ok" if good else "warn", f"Claude Code's server {found[0][0]}: {status.group(1).strip() if status else '?'}",
+                 "" if good else f"claude mcp get {found[0][0]} shows the reason")
+    line("note", CONNECTORS)
+    tokens, ga_token = kit.token_files(a.account), analytics and kit.analytics_file(a.account).exists()
+    line("ok" if tokens else "fail", f"token {tokens[0].name}" if tokens else f"no token in {kit.tokens(a.account)}",
+         "" if tokens else f"run ./auth --account {a.account}")
+    if analytics:
+        line("ok" if ga_token else "fail", "Analytics sign-in " + ("saved" if ga_token else "missing"),
+             "" if ga_token else f"run ./auth-analytics --account {a.account}")
+    signed = data["kit"].get("signed_in")
+    if signed and data["kit"]["audience"] == "testing":
+        ends = datetime.datetime.fromisoformat(signed) + datetime.timedelta(days=7)
+        late = kit.now() > ends - datetime.timedelta(days=1)
+        line("warn" if late else "note", f"your app is in Testing, so this sign-in ends {ends:%Y-%m-%d %H:%M}",
+             "publish the app (docs/03-consent.md), then run ./auth" if late else "")
+    if a.dry_run:
+        for service in data["kit"]["services"] * bool(tokens):
+            print(f"[dry run] would call {kit.SERVICES[service][1]} {json.dumps(kit.SERVICES[service][2])}")
+        if ga_token:
+            print("[dry run] would call the Analytics server's get_account_summaries {}")
+        kit.done("dry run finished. No call was made.")
+    if ga_token:
+        probe_analytics(a.account, data, line)
+    if not tokens:
+        kit.done(f"{len(problems)} problem(s). Fix them from the top, then run ./doctor again.", 1)
+    print(f"\nStarting the server and calling each service once. This takes about a minute.")
+    try:
+        server = kit.workspace(a.account, data, {"BROWSER": "true"})   # a probe must never open a browser
+    except (OSError, TimeoutError, ConnectionError, RuntimeError) as error:
+        line("fail", f"the server at {data['kit']['server']} didn't start: {error}", "run ./setup, then ./doctor again")
+        kit.done(f"{len(problems)} problem(s). Fix them from the top, then run ./doctor again.", 1)
+    try:
+        offered = set(server.tools())
+        for service in data["kit"]["services"]:
+            _, tool, arguments = kit.SERVICES[service]
+            if tool not in offered:   # read-only mode drops some tools, all of Forms among them
+                line("note" if "--read-only" in data["kit"].get("options", []) else "fail",
+                     f"{service:10}{tool} isn't offered by the server in this mode", "")
+                continue
+            start = len(server.log)
+            try:
+                ok, text = server.call(tool, {**arguments, "user_google_email": data["kit"]["email"]})
+            except (TimeoutError, RuntimeError) as error:
+                ok, text = False, str(error)
+            state, fix = verdict(service, ok, text, "\n".join(x for x in server.log[start:] if x), data)
+            line(state, f"{service:10}{tool}", fix)
+    except (ConnectionError, TimeoutError, RuntimeError) as error:
+        line("fail", f"the server didn't answer the checks: {error}", f"run it by hand to see why: {data['kit']['server']} --help")
+    finally:
+        server.close()
+    if problems:
+        kit.done(f"{len(problems)} problem(s). Fix them from the top, then run ./doctor again.", 1)
+    kit.done(f"every service answered for '{a.account}'. Open Claude Code and ask it something (README, By hand, step 8).")
+
+
+if __name__ == "__main__":
+    kit.guarded(main)

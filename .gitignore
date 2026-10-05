@@ -1,0 +1,5 @@
+# Secrets never live in this folder: setup keeps them in ~/.config/google-doors. These are local leftovers.
+.venv/
+__pycache__/
+*.log
+.DS_Store

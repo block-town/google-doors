@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Set up one Google account for Claude Code: install the two servers, keep the account's client in a private file,
+register them with Claude Code, then sign in. Each change outside this folder is printed first and waits for yes."""
+import argparse, getpass, json, os, shlex, shutil, subprocess, sys, tempfile, urllib.request
+from pathlib import Path
+import kit
+
+UV_INSTALLER = "https://astral.sh/uv/install.sh"   # Astral's documented installer (docs.astral.sh/uv, read 2026-10-05)
+AUDIENCES = {"1": "internal", "2": "production", "3": "testing"}
+
+
+def step(dry, text):
+    print(f"\n{'[dry run] would ' if dry else 'Next: '}{text}")
+
+
+def show(cmd):
+    print("  $ " + " ".join(shlex.quote(str(part)) for part in cmd))
+
+
+def get_uv(dry):
+    found = kit.uv()
+    if found:
+        print(f"ok    uv: {found}")
+        return found
+    step(dry, f"download Astral's uv installer from {UV_INSTALLER} to a file you can read, then run it with "
+              "UV_NO_MODIFY_PATH=1 so it edits no shell profile. uv lands in ~/.local/bin; no sudo.")
+    if dry:
+        return None
+    if not kit.ask("Install uv?"):
+        kit.done("stopped: the server needs uv. docs/06-install.md lists other ways to get it.", 1)
+    script = Path(tempfile.mkdtemp()) / "uv-install.sh"
+    request = urllib.request.Request(UV_INSTALLER, headers={"User-Agent": "google-doors"})  # urllib's own is refused
+    with urllib.request.urlopen(request, timeout=60) as answer:
+        script.write_bytes(answer.read())
+    print(f"Saved {script.stat().st_size} bytes to {script}. To read it first, open a second terminal: less {script}")
+    if not kit.ask("Run it now?"):
+        kit.done(f"stopped. The installer is still at {script}; nothing else was changed.", 1)
+    if subprocess.run(["sh", str(script)], env={**os.environ, "UV_NO_MODIFY_PATH": "1"}).returncode or not kit.uv():
+        kit.done("the uv installer failed. The lines above say why.", 1)
+    return kit.uv()
+
+
+def bin_dir(uv_path):
+    out = subprocess.run([uv_path, "tool", "dir", "--bin"], capture_output=True, text=True).stdout.strip() if uv_path else ""
+    return Path(out) if out else Path.home() / ".local" / "bin"
+
+
+def install(uv_path, package, about, dry):
+    version, pins = kit.PINS[package]
+    have = kit.installed(uv_path, package) if uv_path else None
+    if have == version:
+        print(f"ok    {package} {have} is installed")
+        return
+    step(dry, f"install {about}, {package} {version}, as a uv tool{f', replacing {have}' if have else ''}, with every "
+              f"package it needs pinned by {pins}. Its commands go in {bin_dir(uv_path)}:")
+    cmd = [uv_path or "uv", "tool", "install", "--constraints", kit.KIT / pins, f"{package}=={version}"]
+    show(cmd)
+    if dry:
+        return
+    if not kit.ask("Install it?", True):
+        kit.done("stopped before the install. Nothing else was changed.", 1)
+    if subprocess.run(cmd).returncode or kit.installed(uv_path, package) != version:
+        kit.done(f"uv could not install {package}. The lines above say why.", 1)
+
+
+def ask_client(a):
+    """The client comes from the JSON file Google offers (the main way), or typed by hand, hidden, in your own terminal."""
+    terminal = sys.stdin.isatty()
+    source = a.from_json or (terminal and input("\nPath to the client file Google gave you (Enter to type the values instead): ").strip())
+    if source:
+        try:
+            raw = json.loads(Path(source).expanduser().read_text())
+        except (OSError, ValueError) as error:
+            kit.done(f"couldn't read the client file at {source}: {error}. docs/04-client.md shows where Google's file lands.", 1)
+        client = (raw.get("installed") or raw.get("web") or {}) if isinstance(raw, dict) else {}
+        cid, secret = client.get("client_id", ""), client.get("client_secret", "")
+    elif terminal:
+        print("Paste each value and press Enter. Nothing shows as you type, on purpose.")
+        cid = getpass.getpass("  Client ID: ").strip()
+        secret = getpass.getpass("  Client secret: ").strip()
+    else:
+        kit.done("give setup the client file Google gave you, with --from-json <path>, or run ./setup in your own "
+                 "terminal to type the values there. Never paste them into a chat.", 1)
+    if not (a.email or terminal):
+        kit.done("say your Google address with --email, and run ./setup again.", 1)
+    email = (a.email or getpass.getpass("  Your Google address: ")).strip().lower()
+    if not cid.endswith(".apps.googleusercontent.com"):
+        kit.done("that client ID doesn't end in .apps.googleusercontent.com. docs/04-client.md shows where to copy it.", 1)
+    if not secret or " " in secret or "@" not in email:
+        kit.done("the secret or the address looks wrong. Run ./setup again and paste them once more.", 1)
+    print(f"  client ID …{cid[-32:]}, secret of {len(secret)} characters (not shown), address {email}")
+    if not kit.ask("Is that right?", True):
+        kit.done("stopped. Nothing was written.", 1)
+    if not a.audience:
+        print("\nOn the Google Auth Platform's Audience page (docs/03-consent.md), which do you have?\n"
+              "  1  Internal: a Workspace account inside its own organisation\n"
+              "  2  External, In production: published\n"
+              "  3  External, Testing: Google ends the sign-in after 7 days")
+    if not a.audience and not sys.stdin.isatty():
+        kit.done("say which with --audience internal, production or testing, and run ./setup again.", 1)
+    audience = a.audience or AUDIENCES.get(input("Type 1, 2 or 3: ").strip()) or kit.done("type 1, 2 or 3, please.", 1)
+    return cid, secret, email, audience, source
+
+
+def account(a, uv_path, dry):
+    path, services = kit.config_path(a.account), a.services or kit.DEFAULT + (["chat"] if a.chat else [])
+    options = ["--read-only"] * a.read_only + ["--disabled-tools", "send_gmail_message"] * a.no_send
+    analytics = "" if a.no_analytics else str(bin_dir(uv_path) / "analytics-mcp")
+    if path.exists():
+        data = kit.load(a.account)
+        print(f"ok    account '{a.account}': {data['kit']['email']}, client …{data['installed']['client_id'][-32:]}")
+        if dry or kit.ask("Keep this client and address?", True):
+            changed = a.services or a.chat or options
+            data["kit"].update(server=str(bin_dir(uv_path) / "workspace-mcp"), version=kit.VERSION,
+                               services=services if changed else data["kit"]["services"],
+                               options=options if changed else data["kit"].get("options", []),
+                               audience=a.audience or data["kit"]["audience"], analytics=analytics)
+            if not dry:
+                kit.save(a.account, data)
+                if changed:
+                    print("The services or options changed, so Google must be asked again: setup offers ./auth at the end.")
+            return data
+    step(dry, f"read your client from the file Google gave you (or have you type it, hidden, in your terminal), "
+              f"ask for your Google address, and write them to {path}, a file only you can read")
+    if dry:
+        return {"installed": {"client_id": "<your client id>"},
+                "kit": {"email": "<your address>", "services": services, "options": options, "analytics": analytics}}
+    cid, secret, email, audience, source = ask_client(a)
+    data = {"installed": {"client_id": cid, "client_secret": secret, "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                          "token_uri": "https://oauth2.googleapis.com/token", "redirect_uris": ["http://localhost"]},
+            "kit": {"email": email, "services": services, "options": options, "audience": audience, "analytics": analytics,
+                    "version": kit.VERSION,
+                    "server": str(bin_dir(uv_path) / "workspace-mcp"), "written": kit.now().isoformat(timespec="seconds")}}
+    kit.save(a.account, data)
+    kit.private_dir(kit.tokens(a.account))
+    print(f"ok    wrote {path}")
+    if source and not kit.YES and kit.ask(f"Delete the file Google gave you, {source}? This kit keeps a copy."):
+        Path(source).expanduser().unlink()
+    elif source:
+        print(f"The file Google gave you is still at {source}. Delete it once you're done: this kit keeps a copy.")
+    return data
+
+
+def entries(a, uv_path, data, dry):
+    """The servers Claude Code should run for this account: (name, command, args, env)."""
+    if a.gateway:
+        gateway = kit.KIT / "gateway"
+        step(dry, f"install the gateway's Python packages, pinned in gateway/uv.lock, into {gateway / '.venv'}:")
+        show([uv_path or "uv", "sync", "--frozen", "--directory", gateway])
+        if not dry and kit.ask("Go ahead?", True):
+            subprocess.run([uv_path, "sync", "--frozen", "--directory", str(gateway)], check=True)
+        env = {"XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"]} if os.environ.get("XDG_CONFIG_HOME") else {}
+        found = [("google", uv_path or "uv", ["run", "--frozen", "--directory", str(gateway), "server.py"], env)]
+    else:
+        found = [(kit.entry_name(a.account), str(bin_dir(uv_path) / "workspace-mcp"), kit.server_args(data),
+                  kit.entry_env(a.account, data))]
+    if data["kit"]["analytics"]:
+        found.append((kit.entry_name(a.account, "analytics"), data["kit"]["analytics"], [], kit.analytics_env(a.account)))
+    return found
+
+
+def register(name, command, args, env, dry):
+    claude = shutil.which("claude")
+    if not claude:
+        target = Path.home() / ".claude.json"
+        step(dry, f"add the server '{name}' to {target}. The claude command isn't on your PATH, so here is its entry:")
+        print(json.dumps({"mcpServers": {name: {"type": "stdio", "command": command, "args": args, "env": env}}}, indent=2))
+        if dry or not kit.ask(f"Write it into {target}? A dated copy of the old file stays beside it."):
+            return
+        current = json.loads(target.read_text()) if target.exists() else {}
+        if target.exists():
+            shutil.copy2(target, target.with_name(f".claude.json.bak-{kit.now():%Y%m%d-%H%M%S}"))
+        current.setdefault("mcpServers", {})[name] = {"type": "stdio", "command": command, "args": args, "env": env}
+        kit.private_write(target, json.dumps(current, indent=2) + "\n")
+        return
+    cmd = [claude, "mcp", "add", *[part for k, v in env.items() for part in ("--env", f"{k}={v}")],
+           "--scope", "user", "--transport", "stdio", name, "--", command, *args]
+    exists = subprocess.run([claude, "mcp", "get", name], capture_output=True, text=True).returncode == 0
+    step(dry, f"{'replace' if exists else 'add'} the server '{name}' in Claude Code for all your projects "
+              "(user scope, kept in ~/.claude.json). The secret stays in its own file; the entry holds paths and settings:")
+    show(cmd)
+    if dry or not kit.ask("Go ahead?", True):
+        return
+    if exists and subprocess.run([claude, "mcp", "remove", "--scope", "user", name], capture_output=True).returncode:
+        kit.done(f"a server named '{name}' exists in another scope. Remove it with: claude mcp remove {name}", 1)
+    if subprocess.run(cmd).returncode:
+        kit.done("Claude Code refused the entry. The line above says why.", 1)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Set up one Google account for Claude Code.")
+    p.add_argument("--account", default="main", type=kit.valid_account, help="a short name for this account (main)")
+    p.add_argument("--services", nargs="+", choices=sorted(kit.SERVICES), help=f"default: {' '.join(kit.DEFAULT)}")
+    p.add_argument("--read-only", action="store_true", help="ask Google for read-only access; writing tools are off")
+    p.add_argument("--no-send", action="store_true", help="switch off the one tool that sends mail")
+    p.add_argument("--no-analytics", action="store_true", help="leave out Google Analytics (docs/06-install.md)")
+    p.add_argument("--chat", action="store_true", help="add Google Chat (Workspace accounts, docs/05-admin.md)")
+    p.add_argument("--audience", choices=sorted(set(AUDIENCES.values())), help="record your app's status (docs/03)")
+    p.add_argument("--from-json", metavar="FILE", help="the client file Google offers (docs/04-client.md)")
+    p.add_argument("--email", help="your Google address, if setup can't ask for it")
+    p.add_argument("--gateway", action="store_true", help="register the gateway instead (gateway/README.md)")
+    p.add_argument("--dry-run", action="store_true", help="print each step and change nothing")
+    p.add_argument("--yes", action="store_true", help="answer yes to each step: for when you've read the --dry-run plan")
+    a = p.parse_args()
+    if sys.version_info < (3, 10):
+        kit.done(f"this needs Python 3.10 or newer and you have {sys.version.split()[0]}. python.org/downloads has one.", 1)
+    print(f"google-doors setup for the account '{a.account}'. It asks before each change outside this folder.")
+    if not (a.dry_run or sys.stdin.isatty() or a.from_json or kit.config_path(a.account).exists()):   # check before installing
+        kit.done("give setup the client file Google gave you, with --from-json <path>, or run ./setup in your own "
+                 "terminal to type the values there. Never paste them into a chat.", 1)
+    uv_path = get_uv(a.dry_run)
+    install(uv_path, kit.PACKAGE, "the Google Workspace server (Taylor Wilsdon's, MIT licence)", a.dry_run)
+    if not a.no_analytics:
+        install(uv_path, kit.ANALYTICS[0], "Google's own Analytics server (Apache 2.0, marked experimental)", a.dry_run)
+    data = account(a, uv_path, a.dry_run)
+    for entry in entries(a, uv_path, data, a.dry_run):
+        register(*entry, a.dry_run)
+    if a.dry_run:
+        kit.done("dry run finished. Nothing was changed.")
+    if not kit.YES and kit.ask("\nSign in to Google now?", True):   # with --yes, each sign-in runs on its own
+        signed = subprocess.run([sys.executable, str(kit.KIT / "auth"), "--account", a.account]).returncode == 0
+        if signed and data["kit"]["analytics"]:
+            os.execv(sys.executable, [sys.executable, str(kit.KIT / "auth-analytics"), "--account", a.account])
+    then = " then ./auth-analytics" * bool(data["kit"]["analytics"])
+    kit.done(f"set up '{a.account}'. Next, sign in: ./auth{then} (add --account {a.account}{' --yes' * kit.YES})")
+
+
+if __name__ == "__main__":
+    kit.guarded(main)

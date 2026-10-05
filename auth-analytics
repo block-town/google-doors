@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Sign one account in to Google Analytics: a second sign-in, read-only, with the same client. It saves the result as
+the credentials file Google's analytics-mcp reads (Application Default Credentials of type authorized_user), so you
+need no gcloud. Split from auth to keep each script short."""
+import argparse, base64, hashlib, http.server, json, secrets, time, urllib.error, urllib.parse, urllib.request, webbrowser
+import kit
+
+SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+AUTH, TOKEN = "https://accounts.google.com/o/oauth2/v2/auth", "https://oauth2.googleapis.com/token"   # Google's native-app page
+PAGE = b"<!doctype html><title>Signed in</title><p>Google Analytics sign-in received. Close this tab and go back to the terminal."
+SCREENS = """
+Your browser opens Google's sign-in once more, for Analytics alone. What you'll see, in order:
+  1. Choose an account. Pick {email}.
+  2. "Google hasn't verified this app", as before. Click Continue, or Advanced, then "Go to <your app name> (unsafe)".
+  3. One permission, to see your Google Analytics data. Tick it and click Continue.
+  4. A page that says "Google Analytics sign-in received". Close it and come back here.
+Screens 2 and 3 are worded as Google's own gws CLI guide has them; yours may differ slightly."""
+
+
+class Answer(http.server.BaseHTTPRequestHandler):
+    """The one page Google sends your browser back to, at http://127.0.0.1:<port>/ on this computer."""
+    query = {}
+
+    def do_GET(self):
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
+        if "state" in query:
+            Answer.query = query
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(PAGE)
+
+    def log_message(self, *args):   # the address holds the one-time code: keep it off the terminal
+        pass
+
+
+def exchange(client, code, verifier, redirect):
+    """Trade the one-time code for a refresh token at Google's token endpoint."""
+    body = urllib.parse.urlencode({"client_id": client["client_id"], "client_secret": client["client_secret"], "code": code,
+                                   "code_verifier": verifier, "grant_type": "authorization_code", "redirect_uri": redirect})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(TOKEN, body.encode()), timeout=60) as reply:
+            return json.load(reply)
+    except urllib.error.HTTPError as error:
+        try:
+            return {"error": json.load(error).get("error", f"HTTP {error.code}")}
+        except ValueError:
+            return {"error": f"HTTP {error.code}"}
+    except urllib.error.URLError as error:   # no network, or a proxy in the way
+        return {"error": f"couldn't reach Google: {error.reason}"}
+
+
+def main():
+    p = argparse.ArgumentParser(description="Sign one account in to Google Analytics, read-only.")
+    p.add_argument("--account", default="main", type=kit.valid_account)
+    p.add_argument("--dry-run", action="store_true", help="say what would happen and change nothing")
+    p.add_argument("--yes", action="store_true", help="answer yes and skip the Enter: for when Claude runs this")
+    a = p.parse_args()
+    data = kit.load(a.account)
+    if not data["kit"].get("analytics"):
+        kit.done(f"Analytics is off for '{a.account}'. Run ./setup --account {a.account} without --no-analytics.", 1)
+    target, client, email = kit.analytics_file(a.account), data["installed"], data["kit"]["email"]
+    stamp = f"{kit.now():%Y%m%d-%H%M%S}"
+    if target.exists():
+        print(f"{a.account} already has an Analytics sign-in. Signing in again moves it aside as {target.name}.bak-{stamp}.")
+        if a.dry_run:
+            print("[dry run] would ask before moving it")
+        elif not kit.ask("Move it aside and sign in again?"):
+            kit.done("kept the Analytics sign-in you have. ./doctor checks whether it still works.")
+    print(SCREENS.format(email=email))
+    if a.dry_run:
+        kit.done(f"dry run: would ask Google for read-only Analytics access and write {target}.")
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state, listener = secrets.token_urlsafe(16), http.server.HTTPServer(("127.0.0.1", 0), Answer)   # any free port
+    redirect = f"http://127.0.0.1:{listener.server_port}/"
+    url = AUTH + "?" + urllib.parse.urlencode({
+        "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code", "scope": SCOPE, "state": state,
+        "code_challenge": challenge, "code_challenge_method": "S256", "access_type": "offline", "prompt": "consent",
+        "login_hint": email})
+    note = f"\nThe Analytics sign-in gets saved as {target}, readable by you alone."
+    print(note) if kit.YES else input(note + " Press Enter to open the browser. ")
+    if target.exists():
+        target.rename(target.with_name(f"{target.name}.bak-{stamp}"))
+    webbrowser.open(url)
+    print(f"\nIf no browser window opened, copy this address into your browser:\n\n{url}\n\nWaiting for Google's answer "
+          "(10 minutes at most) ...")
+    deadline = time.time() + 600
+    while not Answer.query and time.time() < deadline:
+        listener.timeout = max(1, deadline - time.time())
+        listener.handle_request()
+    listener.server_close()
+    got = Answer.query
+    if not got:
+        kit.done("no answer from Google in 10 minutes. Run ./auth-analytics again.", 1)
+    if got.get("state") != state or "code" not in got:
+        kit.done(f"Google didn't sign you in ({got.get('error', 'the answer belongs to another sign-in')}). "
+                 "Run ./auth-analytics again; docs/10-trouble.md lists the usual reasons.", 1)
+    token = exchange(client, got["code"], verifier, redirect)
+    if "refresh_token" not in token:
+        kit.done(f"the exchange with Google failed ({token.get('error', 'no refresh token came back')}). docs/10-trouble.md.", 1)
+    if SCOPE not in token.get("scope", "").split():
+        kit.done("the Analytics permission was left unticked. Run ./auth-analytics again and tick it.", 1)
+    kit.private_write(target, json.dumps({"type": "authorized_user", "client_id": client["client_id"],
+                                          "client_secret": client["client_secret"],
+                                          "refresh_token": token["refresh_token"]}, indent=1) + "\n")
+    print(f"\nSaved {target}, readable by you alone: the client and this read-only sign-in, nothing else.")
+    if data["kit"]["audience"] == "testing":
+        print("Your app is in Testing, so Google ends this sign-in in 7 days too. docs/03-consent.md shows how to publish.")
+    kit.done(f"Analytics signed in for '{a.account}'. Next: ./doctor --account {a.account}")
+
+
+if __name__ == "__main__":
+    kit.guarded(main)
